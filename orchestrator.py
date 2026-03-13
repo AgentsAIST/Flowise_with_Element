@@ -102,6 +102,29 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_bot_processes_bot_id 
         ON bot_processes(bot_id)
     """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            id SERIAL PRIMARY KEY,
+            bot_id INTEGER NOT NULL REFERENCES bots(id) ON DELETE CASCADE,
+            user_id VARCHAR(255) NOT NULL,
+            room_id VARCHAR(255) NOT NULL,
+            session_id VARCHAR(255),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(bot_id, user_id, room_id)
+        )
+    """)
+    
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_sessions_bot_id 
+        ON sessions(bot_id)
+    """)
+    
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_sessions_user_room 
+        ON sessions(user_id, room_id)
+    """)
     
     conn.commit()
     cursor.close()
@@ -530,7 +553,8 @@ def start_bot_process(bot_id, bot_user_id, flowise_url, password):
                     '--homeserver', env['BOT_HOMESERVER'],
                     '--user', bot_user_id,
                     '--password', password,
-                    '--flowise-url', flowise_url
+                    '--flowise-url', flowise_url,
+                    '--bot-id', str(bot_id)
                 ],
                 stdout=log_f,
                 stderr=subprocess.STDOUT,

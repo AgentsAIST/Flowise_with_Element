@@ -21,6 +21,9 @@ from nio import (
     InviteMemberEvent, LoginError, RoomMessageImage
 )
 
+import psycopg2
+from psycopg2.extras import RealDictCursor
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -48,11 +51,12 @@ EXTENSION_TO_MIME = {ext: mime for mime, ext in MIME_TO_EXTENSION.items()}
 
 class FlowiseBot:
 
-    def __init__(self, homeserver, user_id, password, flowise_url):
+    def __init__(self, homeserver, user_id, password, flowise_url, bot_id=None):
         self.homeserver = homeserver
         self.user_id = user_id
         self.password = password
         self.flowise_url = flowise_url
+        self.bot_id = bot_id
 
         temp_dir = tempfile.gettempdir()
         safe_user_id = user_id.replace('@', '').replace(':', '_').replace('.', '_')
@@ -69,6 +73,112 @@ class FlowiseBot:
         self.file_cache: Dict[Tuple[str, str], List[dict]] = {}
 
         self.session_cache: Dict[str, str] = {}
+        
+        self.db_conn = None
+        self._init_db_connection()
+    
+    def _get_db_connection(self):
+        """Get database connection from environment variables"""
+        return psycopg2.connect(
+            host=os.getenv('DB_HOST', 'postgres'),
+            database=os.getenv('DB_NAME', 'orchestrator'),
+            user=os.getenv('DB_USER', 'orchestrator_user'),
+            password=os.getenv('DB_PASSWORD', 'orchestrator_pass')
+        )
+    
+    def _init_db_connection(self):
+        """Initialize database connection"""
+        try:
+            self.db_conn = self._get_db_connection()
+            logger.info("✅ Database connection established")
+        except Exception as e:
+            logger.warning(f"⚠️ Could not connect to database: {e}. Session persistence disabled.")
+            self.db_conn = None
+    
+    def _get_bot_id_from_db(self) -> Optional[int]:
+        """Get bot_id from database by user_id"""
+        if not self.db_conn:
+            return None
+        try:
+            cursor = self.db_conn.cursor(cursor_factory=RealDictCursor)
+            cursor.execute(
+                "SELECT id FROM bots WHERE bot_user_id = %s",
+                (self.user_id,)
+            )
+            result = cursor.fetchone()
+            cursor.close()
+            if result:
+                logger.info(f"✅ Found bot_id: {result['id']} for user: {self.user_id}")
+                return result['id']
+            else:
+                logger.warning(f"⚠️ No bot found in DB for user: {self.user_id}")
+                return None
+        except Exception as e:
+            logger.error(f"❌ Error getting bot_id from DB: {e}")
+            return None
+    
+    def _get_session_from_db(self, user_id: str, room_id: str) -> Optional[str]:
+        """Get session_id from database for given user and room"""
+        if not self.db_conn or not self.bot_id:
+            return None
+        try:
+            cursor = self.db_conn.cursor(cursor_factory=RealDictCursor)
+            cursor.execute(
+                "SELECT session_id FROM sessions WHERE bot_id = %s AND user_id = %s AND room_id = %s",
+                (self.bot_id, user_id, room_id)
+            )
+            result = cursor.fetchone()
+            cursor.close()
+            if result and result['session_id']:
+                logger.debug(f"📝 Retrieved session from DB for room {room_id[:20]}...")
+                return result['session_id']
+            return None
+        except Exception as e:
+            logger.error(f"❌ Error getting session from DB: {e}")
+            return None
+    
+    def _save_session_to_db(self, user_id: str, room_id: str, session_id: str) -> bool:
+        """Save or update session_id in database"""
+        if not self.db_conn or not self.bot_id:
+            return False
+        try:
+            cursor = self.db_conn.cursor()
+            cursor.execute("""
+                INSERT INTO sessions (bot_id, user_id, room_id, session_id, updated_at)
+                VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
+                ON CONFLICT (bot_id, user_id, room_id) 
+                DO UPDATE SET session_id = EXCLUDED.session_id, updated_at = CURRENT_TIMESTAMP
+            """, (self.bot_id, user_id, room_id, session_id))
+            self.db_conn.commit()
+            cursor.close()
+            logger.debug(f"💾 Saved session to DB for room {room_id[:20]}...")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Error saving session to DB: {e}")
+            if self.db_conn:
+                self.db_conn.rollback()
+            return False
+    
+    def _reset_session_in_db(self, user_id: str, room_id: str, new_session_id: str) -> bool:
+        """Reset session_id in database"""
+        if not self.db_conn or not self.bot_id:
+            return False
+        try:
+            cursor = self.db_conn.cursor()
+            cursor.execute("""
+                UPDATE sessions 
+                SET session_id = %s, updated_at = CURRENT_TIMESTAMP
+                WHERE bot_id = %s AND user_id = %s AND room_id = %s
+            """, (new_session_id, self.bot_id, user_id, room_id))
+            self.db_conn.commit()
+            cursor.close()
+            logger.info(f"🔄 Reset session in DB for room {room_id[:20]}...")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Error resetting session in DB: {e}")
+            if self.db_conn:
+                self.db_conn.rollback()
+            return False
 
     def should_process_message(self, event) -> bool:
         event_source = getattr(event, 'source', {})
@@ -117,12 +227,24 @@ class FlowiseBot:
         return str(uuid.uuid4())
 
     def get_or_create_session(self, room_id: str) -> str:
-        if room_id not in self.session_cache:
-            session_id = self.generate_random_session_id()
-            self.session_cache[room_id] = session_id
-            logger.info(f"📝 Created new session for room {room_id[:20]}...: {session_id}")
+        # First check if we have it in memory cache
+        if room_id in self.session_cache:
+            return self.session_cache[room_id]
+        
+        # Try to get from database
+        db_session = self._get_session_from_db(self.user_id, room_id)
+        if db_session:
+            self.session_cache[room_id] = db_session
+            logger.info(f"📝 Restored session from DB for room {room_id[:20]}...: {db_session}")
+            return db_session
+        
+        # Create new session
+        session_id = self.generate_random_session_id()
+        self.session_cache[room_id] = session_id
+        self._save_session_to_db(self.user_id, room_id, session_id)
+        logger.info(f"📝 Created new session for room {room_id[:20]}...: {session_id}")
 
-        return self.session_cache[room_id]
+        return session_id
 
     def reset_session(self, room_id: str) -> str:
         old_session = self.session_cache.get(room_id, "no session")
@@ -132,6 +254,9 @@ class FlowiseBot:
         keys_to_remove = [key for key in self.file_cache.keys() if key[0] == room_id]
         for key in keys_to_remove:
             del self.file_cache[key]
+        
+        # Update session in database
+        self._reset_session_in_db(self.user_id, room_id, session_id)
         
         logger.info(f"🔄 Reset session for room {room_id[:20]}...")
         return session_id
@@ -705,6 +830,7 @@ Flowise: {self.flowise_url}
             logger.info(f"Starting Flowise Matrix Bot {self.user_id}...")
             logger.info(f"Homeserver: {self.homeserver}")
             logger.info(f"Flowise URL: {self.flowise_url}")
+            logger.info(f"Bot ID: {self.bot_id}")
             logger.info(f"Filter messages newer than: {datetime.fromtimestamp(self.start_time/1000, timezone.utc)}")
 
             if not await self.login_with_retry():
@@ -716,6 +842,14 @@ Flowise: {self.flowise_url}
                 return
 
             logger.info(f"✅ Logged in as {self.client.user_id}")
+            
+            # If bot_id was not provided, try to get it from database
+            if not self.bot_id:
+                self.bot_id = self._get_bot_id_from_db()
+                if self.bot_id:
+                    logger.info(f"✅ Retrieved bot_id from DB: {self.bot_id}")
+                else:
+                    logger.warning("⚠️ Running without bot_id - session persistence will be disabled")
 
             self.client.add_event_callback(self.on_invite, InviteMemberEvent)
             self.client.add_event_callback(self.on_message, RoomMessageText)
@@ -732,6 +866,7 @@ Flowise: {self.flowise_url}
             logger.info("👂 Bot is ready and listening for messages and files...")
             logger.info("📁 Supported file types: PDF, TXT, DOCX, Excel, JSON, CSV, images, code")
             logger.info("💬 Commands: !help, !reset, !session, !status")
+            logger.info("💾 Session persistence: " + ("enabled" if self.db_conn and self.bot_id else "disabled"))
 
             await self.client.sync_forever(timeout=30000)
 
@@ -740,6 +875,12 @@ Flowise: {self.flowise_url}
             import traceback
             traceback.print_exc()
         finally:
+            if self.db_conn:
+                try:
+                    self.db_conn.close()
+                    logger.info("🔒 Database connection closed")
+                except Exception as e:
+                    logger.warning(f"⚠️ Error closing DB connection: {e}")
             if self.client:
                 await self.client.close()
             logger.info("👋 Bot stopped")
@@ -750,6 +891,7 @@ async def main():
     parser.add_argument('--user', required=True, help='Bot user ID (e.g., @bot:localhost)')
     parser.add_argument('--password', required=True, help='Bot password')
     parser.add_argument('--flowise-url', required=True, help='Flowise API URL')
+    parser.add_argument('--bot-id', type=int, default=None, help='Bot ID from database (optional)')
 
     args = parser.parse_args()
 
@@ -757,7 +899,8 @@ async def main():
         homeserver=args.homeserver,
         user_id=args.user,
         password=args.password,
-        flowise_url=args.flowise_url
+        flowise_url=args.flowise_url,
+        bot_id=args.bot_id
     )
     await bot.run()
 
