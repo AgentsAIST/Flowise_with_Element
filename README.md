@@ -2,6 +2,8 @@
 ### <br>
 
 ## [Diagram + DEMO](https://app.holst.so/share/b/6a62eb9a-db48-455b-8a3c-cf1b0d0a8eb1)
+[RAG screencast demo](demo/RAG_for_sysadmin.mp4) <br>
+[Images recognition screencast demo](demo/ImgBatchAnalyse.mp4)
 <br>
 
 ## Configure your .env and homeserver.yaml
